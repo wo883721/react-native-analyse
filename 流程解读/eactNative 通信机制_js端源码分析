@@ -1,0 +1,442 @@
+##ReactNative: 源码分析系列
+[ReactNative 启动过程源码分析](http://www.jianshu.com/p/2c3528e341c7)
+[ReactNative 通信机制_java端源码分析](http://www.jianshu.com/p/d5d63840748c)
+[ReactNative 通信机制_c++端源码分析](http://www.jianshu.com/p/da8585849d05)
+[ReactNative 通信机制_js端源码分析](http://www.jianshu.com/p/1986c115971d)
+
+我们已经分析过了java端，c++端调用流程，只剩下最后一个js端的过程。
+##BatchedBridge.js
+```
+'use strict';
+
+const MessageQueue = require('MessageQueue');
+const BatchedBridge = new MessageQueue();
+
+Object.defineProperty(global, '__fbBatchedBridge', {
+  configurable: true,
+  value: BatchedBridge,
+});
+
+module.exports = BatchedBridge;
+```
+创建一个MessageQueue实例，并将它定义到全局变量中，以便给JSCExecutor.cpp中获取到。
+##MessageQueue.js
+有三个作用：1.注册所有的JavaScriptModule,2.提供方法供c++端调用，3.分发js端NativeModule所有异步方法的调用(同步方法会直接调用c++端代码)。
+```
+constructor() {
+    this._lazyCallableModules = {};
+    this._queue = [[], [], [], 0];
+    this._successCallbacks = [];
+    this._failureCallbacks = [];
+    this._callID = 0;
+    this._lastFlush = 0;
+    this._eventLoopStartTime = new Date().getTime();
+
+    if (__DEV__) {
+      this._debugInfo = {};
+      this._remoteModuleTable = {};
+      this._remoteMethodTable = {};
+    }
+
+    (this: any).callFunctionReturnFlushedQueue = this.callFunctionReturnFlushedQueue.bind(
+      this,
+    );
+    (this: any).callFunctionReturnResultAndFlushedQueue = this.callFunctionReturnResultAndFlushedQueue.bind(
+      this,
+    );
+    (this: any).flushedQueue = this.flushedQueue.bind(this);
+    (this: any).invokeCallbackAndReturnFlushedQueue = this.invokeCallbackAndReturnFlushedQueue.bind(
+      this,
+    );
+  }
+```
+1. _lazyCallableModules:一个Object，储存了所有JavaScriptModule。
+2. _queue：储存js端调用NativeModule的命令。
+>它是一个长度为4的Array，第一个也是Array，储存NativeModule名字的索引数组(它对应着c++的ModuleRegistry.cpp中modules_列表的下标),第二个也是Array，储存NativeModule的method对应索引数组(表示这个方法在NativeModule的methed方法列表中的下表，对应的是JavaModuleWrapper.java的mMethods集合的下表)，第三个也是Array，存储传递参数列表数组。第四个是一个number类型，表示_callID。
+3. _successCallbacks：是一个方法的集合Array。
+>作用是当我们进行NativeModule调用时，可能要接受java端返回数据，那么怎么将这个数据准确赋值给js端调用的地方。这个集合就储存js端成功回调的方法列表。
+4. _failureCallbacks：和上个参数作用相同，储存js端失败回调的方法列表。
+5. _callID：是_successCallbacks和_failureCallbacks的下标，来确定回调对应的方法。
+6. _inCall: 主动通知c++端的标志，当它的值是0，且这个时候js端触发NativeModule方法，那么就可能会直接调用c++方法，在enqueueNativeCall方法中进行分析。
+7. _lastFlush和_eventLoopStartTime：记录时间。
+8. 然后调用bind(this)方法，绑定this变量。
+```
+__guard(fn: () => void) {
+    this._inCall++;
+    try {
+      fn();
+    } catch (error) {
+      ErrorUtils.reportFatalError(error);
+    } finally {
+      this._inCall--;
+    }
+  }
+```
+这个方法是一个监控方法，它四个地方调用，就是c++直接调用js端的四个方法。
+>_inCall自增，表示正在有c++端调用js端代码，我们都知道c++端调用js端代码之后，都会调用自己的callNativeModules方法，所以不用js端主动触发这个方法了
+```
+flushedQueue() {
+    this.__guard(() => {
+      this.__callImmediates();
+    });
+    const queue = this._queue;
+    this._queue = [[], [], [], this._callID];
+    return queue[0].length ? queue : null;
+  }
+```
+这个方法主要得到this._queue数据，并将它重置。this.__callImmediates()是开启开启一个定时器方法，具体可以看JSTimers.js中具体实现(它也是一个JavaScriptModule)
+```
+callFunctionReturnFlushedQueue(module: string, method: string, args: any[]) {
+    this.__guard(() => {
+      this.__callFunction(module, method, args);
+    });
+    return this.flushedQueue();
+  }
+```
+java端调用JavaScriptModule方法，最终就会调用到这个方法。__callFunction调用js端对应JavaScriptModule方法，最后返回js端当前发起的NativeModule异步方法请求列表。
+```
+invokeCallbackAndReturnFlushedQueue(cbID: number, args: any[]) {
+    this.__guard(() => {
+      this.__invokeCallback(cbID, args);
+    });
+    return this.flushedQueue();
+  }
+```
+NativeModule方法调用，java端的结果值就是通过这个方法，回调给js端。
+```
+callFunctionReturnResultAndFlushedQueue(
+    module: string,
+    method: string,
+    args: any[],
+  ) {
+    let result;
+    this.__guard(() => {
+      result = this.__callFunction(module, method, args);
+    });
+    return [result, this.flushedQueue()];
+  }
+```
+这个方法和callFunctionReturnFlushedQueue大体相同，但是它多返回了js端调用JavaScriptModule方法的结果值。
+>原则上它可以实现java端调用JavaScriptModule方法并得到js端的结果值。可惜这个方法还没有完全实现，在Instance.h中的callFunctionSync方法会调用到js的这个方法，但是这个callFunctionSync方法，却没有任何地方调用。
+####下面我们来分析JavaScriptModule的注册：
+```
+registerCallableModule(name: string, module: Object) {
+    this._lazyCallableModules[name] = () => module;
+  }
+```
+向这个_lazyCallableModules中添加这个module。
+>例如在AppRegistry.js中就调用了这个方法，BatchedBridge.registerCallableModule('AppRegistry', AppRegistry); BatchedBridge是MessageQueue的一个实例。
+```
+registerLazyCallableModule(name: string, factory: void => Object) {
+    let module: Object;
+    let getValue: ?(void) => Object = factory;
+    this._lazyCallableModules[name] = () => {
+      if (getValue) {
+        module = getValue();
+        getValue = null;
+      }
+      return module;
+    };
+  }
+```
+也是向_lazyCallableModules添加JavaScriptModule，它在InitializeCore.js中有多处调用。
+```
+getCallableModule(name: string) {
+    const getValue = this._lazyCallableModules[name];
+    return getValue ? getValue() : null;
+  }
+```
+通过JavaScriptModule的名字，得到这个JavaScriptModule。
+```
+__callFunction(module: string, method: string, args: any[]): any {
+    this._lastFlush = new Date().getTime();
+    this._eventLoopStartTime = this._lastFlush;
+    Systrace.beginEvent(`${module}.${method}()`);
+    if (this.__spy) {
+      this.__spy({type: TO_JS, module, method, args});
+    }
+    const moduleMethods = this.getCallableModule(module);
+    invariant(
+      !!moduleMethods,
+      'Module %s is not a registered callable module (calling %s)',
+      module,
+      method,
+    );
+    invariant(
+      !!moduleMethods[method],
+      'Method %s does not exist on module %s',
+      method,
+      module,
+    );
+    const result = moduleMethods[method].apply(moduleMethods, args);
+    Systrace.endEvent();
+    return result;
+  }
+```
+先通过this.getCallableModule(module)获取对应的JavaScriptModule，在使用moduleMethods[method].apply(moduleMethods, args);调用对应的方法，最后返回方法调用的结果值.
+```
+
+  __invokeCallback(cbID: number, args: any[]) {
+    this._lastFlush = new Date().getTime();
+    this._eventLoopStartTime = this._lastFlush;
+
+    // The rightmost bit of cbID indicates fail (0) or success (1), the other bits are the callID shifted left.
+    // eslint-disable-next-line no-bitwise
+    const callID = cbID >>> 1;
+    // eslint-disable-next-line no-bitwise
+    const isSuccess = cbID & 1;
+    const callback = isSuccess
+      ? this._successCallbacks[callID]
+      : this._failureCallbacks[callID];
+
+    if (__DEV__) {
+      const debug = this._debugInfo[callID];
+      const module = debug && this._remoteModuleTable[debug[0]];
+      const method = debug && this._remoteMethodTable[debug[0]][debug[1]];
+      if (!callback) {
+        let errorMessage = `Callback with id ${cbID}: ${module}.${method}() not found`;
+        if (method) {
+          errorMessage =
+            `The callback ${method}() exists in module ${module}, ` +
+            'but only one callback may be registered to a function in a native module.';
+        }
+        invariant(callback, errorMessage);
+      }
+      const profileName = debug
+        ? '<callback for ' + module + '.' + method + '>'
+        : cbID;
+      if (callback && this.__spy) {
+        this.__spy({type: TO_JS, module: null, method: profileName, args});
+      }
+      Systrace.beginEvent(
+        `MessageQueue.invokeCallback(${profileName}, ${stringifySafe(args)})`,
+      );
+    }
+
+    if (!callback) {
+      return;
+    }
+
+    this._successCallbacks[callID] = this._failureCallbacks[callID] = null;
+    callback(...args);
+
+    if (__DEV__) {
+      Systrace.endEvent();
+    }
+  }
+```
+根据cbID，从this._successCallbacks或this._failureCallbacks获取对应的方法callback，然后通过 callback(...args)将java端返回的结果值，回调给js端调用的地方。
+>要理解cbID的作用。NativeModule的调用结果有两个，一个是成功，一个是失败。它们对应的callID(即在_successCallbacks和_failureCallbacks下标)是同一个。失败的cbID对应的是this._callID << 1(即将_callID乘以2，而且它的二进制形式最后一位一定是0)，成功的cbID对应的是(this._callID << 1) | 1(即将_callID乘以2再加1，那么它的二进制形式最后一位一定是1)，这些操作都是在enqueueNativeCall方法中进行的。这样我们虽然是相同的callID，但是我们也可以区分成功还是失败的回调了。
+```
+ enqueueNativeCall(
+    moduleID: number,
+    methodID: number,
+    params: any[],
+    onFail: ?Function,
+    onSucc: ?Function,
+  ) {
+    if (onFail || onSucc) {
+      if (__DEV__) {
+        this._debugInfo[this._callID] = [moduleID, methodID];
+        if (this._callID > DEBUG_INFO_LIMIT) {
+          delete this._debugInfo[this._callID - DEBUG_INFO_LIMIT];
+        }
+      }
+      // Encode callIDs into pairs of callback identifiers by shifting left and using the rightmost bit
+      // to indicate fail (0) or success (1)
+      // eslint-disable-next-line no-bitwise
+      onFail && params.push(this._callID << 1);
+      // eslint-disable-next-line no-bitwise
+      onSucc && params.push((this._callID << 1) | 1);
+      this._successCallbacks[this._callID] = onSucc;
+      this._failureCallbacks[this._callID] = onFail;
+    }
+
+    if (__DEV__) {
+      global.nativeTraceBeginAsyncFlow &&
+        global.nativeTraceBeginAsyncFlow(
+          TRACE_TAG_REACT_APPS,
+          'native',
+          this._callID,
+        );
+    }
+    this._callID++;
+
+    this._queue[MODULE_IDS].push(moduleID);
+    this._queue[METHOD_IDS].push(methodID);
+
+    if (__DEV__) {
+      // Any params sent over the bridge should be encodable as JSON
+      JSON.stringify(params);
+
+      // The params object should not be mutated after being queued
+      deepFreezeAndThrowOnMutationInDev((params: any));
+    }
+    this._queue[PARAMS].push(params);
+
+    const now = new Date().getTime();
+    if (
+      global.nativeFlushQueueImmediate &&
+      (now - this._lastFlush >= MIN_TIME_BETWEEN_FLUSHES_MS ||
+        this._inCall === 0)
+    ) {
+      var queue = this._queue;
+      this._queue = [[], [], [], this._callID];
+      this._lastFlush = now;
+      global.nativeFlushQueueImmediate(queue);
+    }
+    Systrace.counterEvent('pending_js_to_native_queue', this._queue[0].length);
+    if (__DEV__ && this.__spy && isFinite(moduleID)) {
+      this.__spy({
+        type: TO_NATIVE,
+        module: this._remoteModuleTable[moduleID],
+        method: this._remoteMethodTable[moduleID][methodID],
+        args: params,
+      });
+    } else if (this.__spy) {
+      this.__spy({
+        type: TO_NATIVE,
+        module: moduleID + '',
+        method: methodID,
+        args: params,
+      });
+    }
+  }
+```
+所有js端调用NativeModule的异步方法都会走这里(同步方法直接调用c++方法)。
+1. moduleID：对应的ModuleRegistry.cpp中modules_集合的下标。
+2. methodID：对应的是JavaModuleWrapper.java中mMethods集合的下标。
+3. params: 传递给NativeModule方法的调用参数。
+4. onFail 和 onSucc：接受java端结果值的回调。
+>首先当onFail或onSucc有值时，那么就向params数组中多添加cbID。还记得JavaMethodWrapper.java中ARGUMENT_EXTRACTOR_CALLBACK属性中获取的id就是这里的cbID，最终它会回传给__invokeCallback方法。然后就是向this._queue中添加这些moduleID,methodID,params数据。
+##NativeModules.js
+作用是将c++端传递的NativeModules转换成js的NativeModule的对象集合。
+```
+if (global.nativeModuleProxy) {
+  NativeModules = global.nativeModuleProxy;
+} else {
+  const bridgeConfig = global.__fbBatchedBridgeConfig;
+  invariant(bridgeConfig, '__fbBatchedBridgeConfig is not set, cannot invoke native modules');
+
+  const defineLazyObjectProperty = require('defineLazyObjectProperty');
+  (bridgeConfig.remoteModuleConfig || []).forEach((config: ModuleConfig, moduleID: number) => {
+    // Initially this config will only contain the module name when running in JSC. The actual
+    // configuration of the module will be lazily loaded.
+    const info = genModule(config, moduleID);
+    if (!info) {
+      return;
+    }
+
+    if (info.module) {
+      NativeModules[info.name] = info.module;
+    }
+    // If there's no module config, define a lazy getter
+    else {
+      defineLazyObjectProperty(NativeModules, info.name, {
+        get: () => loadModule(info.name, moduleID)
+      });
+    }
+  });
+}
+```
+1. 如果全局变量中存在nativeModuleProxy变量，那么就把它当成NativeModules。
+2. 如果没有，那么获取global.__fbBatchedBridgeConfig变量，它是由c++端构建，是一个Object，有一个remoteModuleConfig属性的数组，这个数组储存了所有的NativeModule的信息。
+>每个NativeModule的格式
+["ImageLoader",{},["abortRequest","getSize","prefetchImage","queryCache"],[1,2,3]] 它是一个数组:
+>1. 表示NativeModule的模板名。
+>2. 表示这个NativeModule所有常量的对象(相当于map)。
+>3. 表示NativeModule所有方法名的数组。
+>4. 是一个储存下标的数组，表示这个NativeModule那些方法是promise类型。
+>5. 可能还有第五个参数，也是一个储存下标的数组，表示个NativeModule那些方法是sync类型的，即同步等待java端返回结果值得。
+
+3.遍历这个remoteModuleConfig数组，通过genModule方法生成对应的js端NativeModule，注册到NativeModules中。
+```
+function genModule(config: ?ModuleConfig, moduleID: number): ?{name: string, module?: Object} {
+  if (!config) {
+    return null;
+  }
+
+  const [moduleName, constants, methods, promiseMethods, syncMethods] = config;
+  invariant(!moduleName.startsWith('RCT') && !moduleName.startsWith('RK'),
+    'Module name prefixes should\'ve been stripped by the native side ' +
+    'but wasn\'t for ' + moduleName);
+
+  if (!constants && !methods) {
+    // Module contents will be filled in lazily later
+    return { name: moduleName };
+  }
+
+  const module = {};
+  methods && methods.forEach((methodName, methodID) => {
+    const isPromise = promiseMethods && arrayContains(promiseMethods, methodID);
+    const isSync = syncMethods && arrayContains(syncMethods, methodID);
+    invariant(!isPromise || !isSync, 'Cannot have a method that is both async and a sync hook');
+    const methodType = isPromise ? 'promise' : isSync ? 'sync' : 'async';
+    module[methodName] = genMethod(moduleID, methodID, methodType);
+  });
+  Object.assign(module, constants);
+
+  if (__DEV__) {
+    BatchedBridge.createDebugLookup(moduleID, moduleName, methods);
+  }
+
+  return { name: moduleName, module };
+}
+```
+生成js端的NativeModule。
+1. const [moduleName, constants, methods, promiseMethods, syncMethods] = config;解析出来参数在上一个方法中已经分析过了。
+2. 遍历这个methods数组，通过genMethod方法，生成Method方法，赋值到module对象中。
+>注意方法有三种类型，promise：通过Promise方式接收返回值的异步方法，async：通过Callback方式接收返回值得异步方法，sync：等待接收返回值的同步方法。
+
+3.再将constants对象的属性全部赋值到module对象中，所以我们可以在js端的通过NativeModule实例，直接使用Java端NativeModule定义的常量值。
+```
+function genMethod(moduleID: number, methodID: number, type: MethodType) {
+  let fn = null;
+  if (type === 'promise') {
+    fn = function(...args: Array<any>) {
+      return new Promise((resolve, reject) => {
+        BatchedBridge.enqueueNativeCall(moduleID, methodID, args,
+          (data) => resolve(data),
+          (errorData) => reject(createErrorFromErrorData(errorData)));
+      });
+    };
+  } else if (type === 'sync') {
+    fn = function(...args: Array<any>) {
+      if (__DEV__) {
+        invariant(global.nativeCallSyncHook, 'Calling synchronous methods on native ' +
+          'modules is not supported in Chrome.\n\n Consider providing alternative ' +
+          'methods to expose this method in debug mode, e.g. by exposing constants ' +
+          'ahead-of-time.');
+      }
+      return global.nativeCallSyncHook(moduleID, methodID, args);
+    };
+  } else {
+    fn = function(...args: Array<any>) {
+      const lastArg = args.length > 0 ? args[args.length - 1] : null;
+      const secondLastArg = args.length > 1 ? args[args.length - 2] : null;
+      const hasSuccessCallback = typeof lastArg === 'function';
+      const hasErrorCallback = typeof secondLastArg === 'function';
+      hasErrorCallback && invariant(
+        hasSuccessCallback,
+        'Cannot have a non-function arg after a function arg.'
+      );
+      const onSuccess = hasSuccessCallback ? lastArg : null;
+      const onFail = hasErrorCallback ? secondLastArg : null;
+      const callbackCount = hasSuccessCallback + hasErrorCallback;
+      args = args.slice(0, args.length - callbackCount);
+      BatchedBridge.enqueueNativeCall(moduleID, methodID, args, onFail, onSuccess);
+    };
+  }
+  fn.type = type;
+  return fn;
+}
+```
+分三种情况：
+1.  promise：返回一个方法，这个方法的返回值是Promise。
+>调用BatchedBridge.enqueueNativeCall方法，然后等待BatchedBridge的回调。
+2. sync：返回一个方法，这个方法的返回值就是java端调用的结果值。
+>它调用global.nativeCallSyncHook方法，这个方法是在JSCExecutor.cpp中注册到全局变量global中的，所以会调用JSCExecutor.cpp中的nativeCallSyncHook，然后调用到java端，得到结果值，返回到js端，整个过程都在同步等待。
+3. async：返回一个方法，这个方法没有返回值,
+>但是调用这个方法时，可以最后一个参数传一个方法，通过这个方法回传java端返回的结果值。对应的java端NativeModule方法定义的时候也要定义这个Callback参数。这种方式没有promise好，所以请尽量使用promise方法。最后也是使用BatchedBridge.enqueueNativeCall发送事件，等待回调。
+#下节预览
+我们分析完了ReactNative的通信机制，那么还剩下一个重要点，就是怎么根据js端代码生成android端view的，又是怎么相互操作的。那么就要分析UIManagerModule这个类，我们在下一节进行分析。

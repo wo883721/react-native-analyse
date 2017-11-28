@@ -1,0 +1,360 @@
+##ReactNative: 源码分析系列
+[ReactNative 启动过程源码分析](http://www.jianshu.com/p/2c3528e341c7)
+[ReactNative 通信机制_java端源码分析](http://www.jianshu.com/p/d5d63840748c)
+[ReactNative 通信机制_c++端源码分析](http://www.jianshu.com/p/da8585849d05)
+[ReactNative 通信机制_js端源码分析](http://www.jianshu.com/p/1986c115971d)
+
+通信机制主要分成三部分，java端，c++端以及js端。调用的方式分成两种JavaScriptModule和NativeModule。
+1. JavaScriptModule：表示js端提供的模型以及方法，java调用模型的方法既可以通知js端，典型的有AppRegistry。java端就是一个接口AppRegistry.js,而js端AppRegistry.js提供了具体操作。
+2. NativeModule：表示java端提供了模型和方法，供js端来回调。
+####这一节我们主要分析java端的源码：
+##JavaScriptModuleRegistry
+通过动态代理的方式，回调CatalystInstance.callFunction方法，然后调用CatalystInstance.jniCallJSFunction方法，从而调用CatalystInstance.cpp对应jniCallJSFunction，最终调用到js端MessageQueue.js的__callFunction方法，然后就可以找到js端JavaScriptModule对应的方法并调用。
+```
+public synchronized <T extends JavaScriptModule> T getJavaScriptModule(
+      CatalystInstance instance,
+      Class<T> moduleInterface) {
+    JavaScriptModule module = mModuleInstances.get(moduleInterface);
+    if (module != null) {
+      return (T) module;
+    }
+
+    JavaScriptModule interfaceProxy = (JavaScriptModule) Proxy.newProxyInstance(
+        moduleInterface.getClassLoader(),
+        new Class[]{moduleInterface},
+        new JavaScriptModuleInvocationHandler(instance, moduleInterface));
+    mModuleInstances.put(moduleInterface, interfaceProxy);
+    return (T) interfaceProxy;
+  }
+```
+通过JavaScriptModule的class来获取它的代理实例。
+>我们并不需要JavaScriptModule的真正的实例，因为它的实现是在js端，java端只需要提供对应的module模板名，method方法名以及args调用参数，就可以回调js端对应的方法了。
+####JavaScriptModuleInvocationHandler
+```
+@Override
+    public @Nullable Object invoke(Object proxy, Method method,
+            @Nullable Object[] args) throws Throwable {
+      NativeArray jsArgs = args != null
+        ? Arguments.fromJavaArgs(args)
+        : new WritableNativeArray();
+      mCatalystInstance.callFunction(getJSModuleName(), method.getName(), jsArgs);
+      return null;
+    }
+```
+当我们用得到的代理实例JavaScriptModule调用方法时，就会回调这个方法。
+>例如catalystInstance.getJSModule(AppRegistry.class).runApplication(jsAppModuleName, appParams);就会调用这个方法。
+
+这个方法会调用mCatalystInstance.callFunction方法，提供JavaScriptModule的module、method、args。从而回调jniCallJSFunction方法，最终会调用到js端JavaScriptModule对应方法。
+##NativeModuleRegistry
+向c++端提供java端所有的NativeModule。主要是两个方法：getJavaModules和getCxxModules。这个两个方法都是c++端直接调用的。
+```
+  /* package */ Collection<JavaModuleWrapper> getJavaModules(
+      JSInstance jsInstance) {
+    ArrayList<JavaModuleWrapper> javaModules = new ArrayList<>();
+    for (Map.Entry<Class<? extends NativeModule>, ModuleHolder> entry :
+          mModules.entrySet()) {
+      Class<? extends NativeModule> type = entry.getKey();
+      if (!CxxModuleWrapperBase.class.isAssignableFrom(type)) {
+        javaModules.add(new JavaModuleWrapper(jsInstance, type, entry.getValue()));
+      }
+    }
+    return javaModules;
+  }
+```
+ 返回一个JavaModuleWrapper的集合。
+>接受一个参数JSInstance，它是一个接口，只有一个invokeCallback方法，作用是向js端传递数据。考虑下面情况，我们在js端调用NativeModule的方法，如果这是一个异步方法，那么这个方法的结果值怎么回传给js端呢，就是通过这个JSInstance(注意如果是同步方法就不用了，因为同步方法结果值是直接返回的)。
+
+遍历所有的mModules，排除所有CxxModuleWrapperBase子类的NativeModule，然后创建JavaModuleWrapper实例添加到集合中。
+##JavaModuleWrapper
+主要是向c++端这个NativeModule所有的方法说明，Constants常量，以及接受c++回调。
+```
+@DoNotStrip
+  public List<MethodDescriptor> getMethodDescriptors() {
+    if (mDescs.isEmpty()) {
+      findMethods();
+    }
+    return mDescs;
+  }
+```
+这个方法是c++端调用的，返回这个NativeModule的所有被@ReactMethod注释方法的描述。
+>mDescs和mMethods这两个集合大小相同，储存的方法也是一一对应的，mDescs返回给c++端，所以c++就可以集合下标索引找到mMethods对应的方法，就可以进行回调了。
+```
+  @DoNotStrip
+  private void findMethods() {
+    Systrace.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE, "findMethods");
+    Set<String> methodNames = new HashSet<>();
+
+    Class<? extends NativeModule> classForMethods = mModuleClass;
+    Class<? extends NativeModule> superClass =
+        (Class<? extends NativeModule>) mModuleClass.getSuperclass();
+    if (ReactModuleWithSpec.class.isAssignableFrom(superClass)) {
+      // For java module that is based on generated flow-type spec, inspect the
+      // spec abstract class instead, which is the super class of the given java
+      // module.
+      classForMethods = superClass;
+    }
+    Method[] targetMethods = classForMethods.getDeclaredMethods();
+
+    for (Method targetMethod : targetMethods) {
+      ReactMethod annotation = targetMethod.getAnnotation(ReactMethod.class);
+      if (annotation != null) {
+        String methodName = targetMethod.getName();
+        if (methodNames.contains(methodName)) {
+          // We do not support method overloading since js sees a function as an object regardless
+          // of number of params.
+          throw new IllegalArgumentException(
+            "Java Module " + getName() + " method name already registered: " + methodName);
+        }
+        MethodDescriptor md = new MethodDescriptor();
+        JavaMethodWrapper method = new JavaMethodWrapper(this, targetMethod, annotation.isBlockingSynchronousMethod());
+        md.name = methodName;
+        md.type = method.getType();
+        if (md.type == BaseJavaModule.METHOD_TYPE_SYNC) {
+          md.signature = method.getSignature();
+          md.method = targetMethod;
+        }
+        mMethods.add(method);
+        mDescs.add(md);
+      }
+    }
+    Systrace.endSection(TRACE_TAG_REACT_JAVA_BRIDGE);
+  }
+```
+这个方法通过反射，得到NativeModule所有被@ReactMethod注解的方法，创建MethodDescriptor和JavaMethodWrapper存入对应的列表中。
+>注意当ReactMethod方法是同步方法时，MethodDescriptor会储存这个method和signature，因为当是同步方法时，js端要直接获取java端方法调用的结果值，所以就不能通过invoke方法回调了。c++端拥有方法的引用(就是这个MethodDescriptor的method)，直接调用得到结果值，返回给js端。
+
+>仔细看这段代码，会发现有个问题。就是methodNames这个集合，它的作用是判断不允许有方法名重复的方法，可惜这个集合从来没有被添加过数据，所以就没有作用。那么为什么不能方法名重复呢，我们都知道java中方法名重复参数不一样，叫做方法重载，但是js是没有方法重载的。所以我们在NativeModule中定义重载方法，js端就只有一个方法，就会出现问题。
+```
+  @DoNotStrip
+  public @Nullable NativeMap getConstants() {
+    if (!mModuleHolder.getHasConstants()) {
+      return null;
+    }
+
+    final String moduleName = getName();
+    SystraceMessage.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE,
+        "JavaModuleWrapper.getConstants")
+      .arg("moduleName", moduleName)
+      .flush();
+    ReactMarker.logMarker(GET_CONSTANTS_START, moduleName);
+
+    BaseJavaModule baseJavaModule = getModule();
+
+    Systrace.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE, "module.getConstants");
+    Map<String, Object> map = baseJavaModule.getConstants();
+    Systrace.endSection(TRACE_TAG_REACT_JAVA_BRIDGE);
+
+    Systrace.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE, "create WritableNativeMap");
+    ReactMarker.logMarker(CONVERT_CONSTANTS_START, moduleName);
+    try {
+      return Arguments.makeNativeMap(map);
+    } finally {
+      ReactMarker.logMarker(CONVERT_CONSTANTS_END);
+      Systrace.endSection(TRACE_TAG_REACT_JAVA_BRIDGE);
+
+      ReactMarker.logMarker(GET_CONSTANTS_END);
+      SystraceMessage.endSection(TRACE_TAG_REACT_JAVA_BRIDGE).flush();
+    }
+  }
+```
+这个方法也是由c++端调用，通过调用getConstants()得到NativeModule的常量，供给js端使用。
+```
+@DoNotStrip
+  public void invoke(int methodId, ReadableNativeArray parameters) {
+    if (mMethods == null || methodId >= mMethods.size()) {
+      return;
+    }
+
+    mMethods.get(methodId).invoke(mJSInstance, parameters);
+  }
+```
+也是由c++端调用，来调用NativeModule对应的异步方法(同步方法在c++直接调用，不会走这里)。
+>methodId表示在集合中的索引(c++和java端方法列表的索引是一一对应的)，parameters：js端传递来的参数。mJSInstance：用于将方法的结果值通知给js端。
+##JavaMethodWrapper
+调用NativeModule对应的方法，但是要处理两个问题，第一处理ReadableNativeArray数据将它转成方法对应的参数，第二区分处理NativeModule方法对应的三种类型sync、async、 promise。
+>1. sync表示同步方法，js端直接得到java端方法调用的返回值。
+>2. async和promise都是异步方法，它们本质上都是通过Callback.java这个类的invoke方法，回调JSInstance的invokeCallback方法，调用子类CatalystInstanceImpl的invokeCallback方法，从而调用c++的jniCallJSCallback方法，最终调用js端MessageQueue.js的__invokeCallback方法，将java端方法调用结果值返回给js端。只不过promise方式对Callback.java进行了包装(具体参考PromiseImpl.java)
+```
+private static abstract class ArgumentExtractor<T> {
+    public int getJSArgumentsNeeded() {
+      return 1;
+    }
+
+    public abstract @Nullable T extractArgument(
+      JSInstance jsInstance, ReadableNativeArray jsArguments, int atIndex);
+  }
+```
+它是用来提取ReadableNativeArray中的参数。
+```
+  static final private ArgumentExtractor<Callback> ARGUMENT_EXTRACTOR_CALLBACK =
+    new ArgumentExtractor<Callback>() {
+      @Override
+      public @Nullable Callback extractArgument(
+        JSInstance jsInstance, ReadableNativeArray jsArguments, int atIndex) {
+        if (jsArguments.isNull(atIndex)) {
+          return null;
+        } else {
+          int id = (int) jsArguments.getDouble(atIndex);
+          return new com.facebook.react.bridge.CallbackImpl(jsInstance, id);
+        }
+      }
+    };
+```
+id：这个参数js端使用，来确定返回值给对应module的调用。CallbackImpl这个类主要会调用invokeCallback方法，最终会调用到MessageQueue.js的__invokeCallback方法。
+```
+static final private ArgumentExtractor<Promise> ARGUMENT_EXTRACTOR_PROMISE =
+    new ArgumentExtractor<Promise>() {
+      @Override
+      public int getJSArgumentsNeeded() {
+        return 2;
+      }
+
+      @Override
+      public Promise extractArgument(
+        JSInstance jsInstance, ReadableNativeArray jsArguments, int atIndex) {
+        Callback resolve = ARGUMENT_EXTRACTOR_CALLBACK
+          .extractArgument(jsInstance, jsArguments, atIndex);
+        Callback reject = ARGUMENT_EXTRACTOR_CALLBACK
+          .extractArgument(jsInstance, jsArguments, atIndex + 1);
+        return new PromiseImpl(resolve, reject);
+      }
+    };
+```
+它需要消耗的参数是两个，因为有正确的回调和异常的回调，返回一个PromiseImpl实例，它是Promise子类，当我们调用resolve或者reject方法时，都会调用CallbackImpl的invokeCallback，来通知js端。
+```
+private void processArguments() {
+    if (mArgumentsProcessed) {
+      return;
+    }
+    SystraceMessage.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE, "processArguments")
+      .arg("method", mModuleWrapper.getName() + "." + mMethod.getName())
+      .flush();
+    try {
+      mArgumentsProcessed = true;
+      mArgumentExtractors = buildArgumentExtractors(mParameterTypes);
+      mSignature = buildSignature(
+          mMethod,
+          mParameterTypes,
+          (mType.equals(BaseJavaModule.METHOD_TYPE_SYNC)));
+      mArguments = new Object[mParameterTypes.length];
+      mJSArgumentsNeeded = calculateJSArgumentsNeeded();
+    } finally {
+      SystraceMessage.endSection(TRACE_TAG_REACT_JAVA_BRIDGE).flush();
+    }
+  }
+```
+通过反射，获取方法的参数类型列表，来生成mArgumentExtractors列表，用来解析ReadableNativeArray。
+```
+ @Override
+ @Override
+  public void invoke(JSInstance jsInstance, ReadableNativeArray parameters) {
+    String traceName = mModuleWrapper.getName() + "." + mMethod.getName();
+    SystraceMessage.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE,
+          "callJavaModuleMethod")
+      .arg("method", traceName)
+      .flush();
+    if (DEBUG) {
+      PrinterHolder.getPrinter()
+          .logMessage(
+              ReactDebugOverlayTags.BRIDGE_CALLS,
+              "JS->Java: %s.%s()",
+              mModuleWrapper.getName(),
+              mMethod.getName());
+    }
+    try {
+      if (!mArgumentsProcessed) {
+        processArguments();
+      }
+      if (mArguments == null || mArgumentExtractors == null) {
+        throw new Error("processArguments failed");
+      }
+      if (mJSArgumentsNeeded != parameters.size()) {
+        throw new NativeArgumentsParseException(
+          traceName + " got " + parameters.size()
+          + " arguments, expected " + mJSArgumentsNeeded);
+      }
+
+      int i = 0, jsArgumentsConsumed = 0;
+      try {
+        for (; i < mArgumentExtractors.length; i++) {
+          mArguments[i] = mArgumentExtractors[i].extractArgument(
+            jsInstance, parameters, jsArgumentsConsumed);
+          jsArgumentsConsumed += mArgumentExtractors[i].getJSArgumentsNeeded();
+        }
+      } catch (UnexpectedNativeTypeException e) {
+        throw new NativeArgumentsParseException(
+          e.getMessage() + " (constructing arguments for " + traceName
+            + " at argument index " +
+            getAffectedRange(jsArgumentsConsumed,
+             mArgumentExtractors[i].getJSArgumentsNeeded()) +
+            ")",
+          e);
+      }
+
+      try {
+        mMethod.invoke(mModuleWrapper.getModule(), mArguments);
+      } catch (IllegalArgumentException ie) {
+        throw new RuntimeException("Could not invoke " + traceName, ie);
+      } catch (IllegalAccessException iae) {
+        throw new RuntimeException("Could not invoke " + traceName, iae);
+      } catch (InvocationTargetException ite) {
+        if (ite.getCause() instanceof RuntimeException) {
+          throw (RuntimeException) ite.getCause();
+        }
+        throw new RuntimeException("Could not invoke " + traceName, ite);
+      }
+    } finally {
+      SystraceMessage.endSection(TRACE_TAG_REACT_JAVA_BRIDGE).flush();
+    }
+  }
+```
+将parameters转换成method对应的参数，然后通过 mMethod.invoke(mModuleWrapper.getModule(), mArguments)进行方法调用。
+##CatalystInstanceImpl
+  通过这个类主动调用c++端方法
+```
+ private native void initializeBridge(
+      ReactCallback callback,
+      JavaScriptExecutor jsExecutor,
+      MessageQueueThread jsQueue,
+      MessageQueueThread moduleQueue,
+      MessageQueueThread uiBackgroundQueue,
+      Collection<JavaModuleWrapper> javaModules,
+      Collection<ModuleHolder> cxxModules);
+```
+调用CatalystInstanceImpl.cpp中对应方法。
+1. ReactCallback：用于c++回调。
+2. jsExecutor：js执行器，对应JSCExecutor.cpp实例。
+3. jsQueue、moduleQueue、uiBackgroundQueue用c++不同线程中的回调。
+4. javaModules、cxxModules将NativeModule传递给C++。
+```
+private native void jniCallJSFunction(
+    String module,
+    String method,
+    NativeArray arguments);
+```
+这个方法用来调用js端JavaScriptModule对应方法。
+当在java端调用JavaScriptModule方法时,
+>例如catalystInstance.getJSModule(AppRegistry.class).runApplication(jsAppModuleName, appParams))
+
+就会调用到JavaScriptModuleRegistry中JavaScriptModuleInvocationHandler内部类的invoke方法，调用CatalystInstanceImpl的callFunction方法，接着调用PendingJSCall的call方法，就会调用到jniCallJSFunction这个方法了。
+```
+private native void jniCallJSCallback(int callbackID, NativeArray arguments);
+```
+当js端调用NativeModule的异步方法时，通过这个方法返回java端方法调用的结果值的。
+java端NativeModule对应方法调用完成后，我们手动调用Callback的invoke方法
+>这个Callback是我们自定义方法形参，如果没有定义它或者Promise，那么就表示不需要返回给js端数据，因为没办法将js端传递值。这里指的是异步方法.。
+
+进而调用JSInstance的invokeCallback方法，然后就会回调到jniCallJSCallback这个方法。
+#总结
+####JavaScriptModule：
+java端使用module名,method名通过jniCallJSFunction( String module, String method, NativeArray arguments)方法调用js端JavaScriptModule对应的方法。
+>注意:这种方式不能得到js端方法调用的返回值的。其实从c++和js端源码看出它是有一个可以得到返回值的方法，可惜java端并没有此方法的调用，具体会在接下来两章中分析。
+####NativeModule：
+js端调用java端方法的方式,对应js端NativeModules.js。分为同步方法和异步方法：
+1. 同步方法会在c++端直接调用，得到结果值，返回给js端。
+2. 异步方法由c++端调用JavaModuleWrapper的invoke方法，再调用JavaMethodWrapper的invoke方法，最终会调用到CatalystInstanceImpl的jniCallJSCallback方法，最后会调用到MessageQueue.js的__invokeCallback方法。
+
+###下节预览
+java端通信模块的代码已经分析完了，下面是c++端通信模块的代码。
+
+
