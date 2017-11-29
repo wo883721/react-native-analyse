@@ -1,0 +1,322 @@
+##ReactNative: 源码分析系列
+[ReactNative 启动过程源码分析](http://www.jianshu.com/p/2c3528e341c7)
+[ReactNative 通信机制_java端源码分析](http://www.jianshu.com/p/d5d63840748c)
+[ReactNative 通信机制_c++端源码分析](http://www.jianshu.com/p/da8585849d05)
+[ReactNative 通信机制_js端源码分析](http://www.jianshu.com/p/1986c115971d)
+
+这一节我们分析ReactNative在Android端是怎么启动的，又创建了那些重要的实例。
+ 既然是Android项目，那么就要找Application和Activity这个两个类，对应的react项目是ReactApplication和ReactActivity。
+##ReactApplication
+ ```
+public interface ReactApplication {
+  ReactNativeHost getReactNativeHost();
+}
+```
+  它是一个接口，只有一个方法返回一个ReactNativeHost类的实例，这个ReactNativeHost类很重要，它持有ReactInstanceManager类的实例，并且返回List<ReactPackage>集合，具体的我们放在下面内容再说。
+## ReactActivity
+```
+public abstract class ReactActivity extends Activity
+    implements DefaultHardwareBackBtnHandler, PermissionAwareActivity
+```
+它继承自Activity(不是v7包下的AppCompatActivity)，实现了两个接口：1.DefaultHardwareBackBtnHandler：处理默认的返回事件。2. PermissionAwareActivity：主要是处理Android6.0的权限声明的回调。
+
+我们必须复写getMainComponentName()方法,返回值与js端AppRegistry.registerComponent注册的那个字符串值是一样的。
+```
+  protected @Nullable String getMainComponentName() {
+    return null;
+  }
+```
+ReactActivity只有一个成员变量ReactActivityDelegate，它帮助处理ReactActivity事件的回调。
+然后我们来看看ReactActivity生命周期开启的方法onCreate：
+```
+ @Override
+  protected void onCreate(Bundle savedInstanceState) {
+    super.onCreate(savedInstanceState);
+    mDelegate.onCreate(savedInstanceState);
+  }
+```
+可以看出来它将事件的处理直接交给代理类了。接下来我们就分析ReactActivityDelegate。
+##ReactActivityDelegate
+```
+  private final @Nullable Activity mActivity;
+  private final @Nullable FragmentActivity mFragmentActivity;
+  private final @Nullable String mMainComponentName;
+
+  private @Nullable ReactRootView mReactRootView;
+  private @Nullable DoubleTapReloadRecognizer mDoubleTapReloadRecognizer;
+  private @Nullable PermissionListener mPermissionListener;
+  private @Nullable Callback mPermissionsCallback;
+
+  public ReactActivityDelegate(Activity activity,
+      @Nullable String mainComponentName) {
+    mActivity = activity;
+    mMainComponentName = mainComponentName;
+    mFragmentActivity = null;
+  }
+
+  public ReactActivityDelegate(
+    FragmentActivity fragmentActivity,
+    @Nullable String mainComponentName) {
+    mFragmentActivity = fragmentActivity;
+    mMainComponentName = mainComponentName;
+    mActivity = null;
+  }
+```
+首先分析一下它拥有的成员属性：
+ 1. mActivity，mFragmentActivity和mMainComponentName：这三个值是由构造函数赋值的(当然mActivity和mFragmentActivity只能有一个是有值的).
+2. mReactRootView:这个属性很重要，由它来启动和js端的交互的，也代表js端视图的根view，最终被设置为Activity的ContentView。
+3. mDoubleTapReloadRecognizer:主要是监听双击‘R’键，重新加载js文件。
+4. mPermissionListener与mPermissionsCallback：主要是用于6.0以后权限申请回调的。
+```
+  protected void onCreate(Bundle savedInstanceState) {
+    boolean needsOverlayPermission = false;
+    if (getReactNativeHost().getUseDeveloperSupport() &&
+       Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      // Get permission to show redbox in dev builds.
+      if (!Settings.canDrawOverlays(getContext())) {
+        needsOverlayPermission = true;
+        Intent serviceIntent = new Intent(
+          Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+          Uri.parse("package:" + getContext().getPackageName()));
+        FLog.w(ReactConstants.TAG, REDBOX_PERMISSION_MESSAGE);
+        Toast.makeText(getContext(), REDBOX_PERMISSION_MESSAGE,
+              Toast.LENGTH_LONG).show();
+        ((Activity) getContext()).startActivityForResult(serviceIntent,
+               REQUEST_OVERLAY_PERMISSION_CODE);
+      }
+    }
+
+    if (mMainComponentName != null && !needsOverlayPermission) {
+      loadApp(mMainComponentName);
+    }
+    mDoubleTapReloadRecognizer = new DoubleTapReloadRecognizer();
+  }
+```
+如果是开发模式并且是6.0以上的手机，那么就会申请系统悬浮框权限，并且会跳过loadApp方法，只有当权限申请成功才能调用loadApp方法。
+如果不满足上面判断，且mMainComponentName不为空，那么就调用loadApp方法。
+```
+protected void loadApp(String appKey) {
+    if (mReactRootView != null) {
+      throw new IllegalStateException(
+            "Cannot loadApp while app is already running.");
+    }
+    mReactRootView = createRootView();
+    mReactRootView.startReactApplication(
+      getReactNativeHost().getReactInstanceManager(),
+      appKey,
+      getLaunchOptions());
+    getPlainActivity().setContentView(mReactRootView);
+  }
+```
+这个方法主要是创建mReactRootView，调用它的startReactApplication方法，最后将mReactRootView设置成Activity的ContentView。
+getReactNativeHost()方法，通过ReactApplication来获取这个ReactNativeHost。这里我们先来分析ReactNativeHost和ReactInstanceManager，然后再分析startReactApplication方法的调用。
+###ReactNativeHost
+ 这个类主要是负责ReactInstanceManager创建，并持有这个ReactInstanceManager类的实例。
+```
+protected ReactInstanceManager createReactInstanceManager() {
+    ReactInstanceManagerBuilder builder = ReactInstanceManager.builder()
+      .setApplication(mApplication)
+      .setJSMainModulePath(getJSMainModuleName())
+      .setUseDeveloperSupport(getUseDeveloperSupport())
+      .setRedBoxHandler(getRedBoxHandler())
+      .setJavaScriptExecutorFactory(getJavaScriptExecutorFactory())
+      .setUIImplementationProvider(getUIImplementationProvider())
+      .setInitialLifecycleState(LifecycleState.BEFORE_CREATE);
+
+    for (ReactPackage reactPackage : getPackages()) {
+      builder.addPackage(reactPackage);
+    }
+
+    String jsBundleFile = getJSBundleFile();
+    if (jsBundleFile != null) {
+      builder.setJSBundleFile(jsBundleFile);
+    } else {
+      builder.setBundleAssetName(Assertions.assertNotNull(getBundleAssetName()));
+    }
+    return builder.build();
+  }
+```
+  这里采用建造者模式来创建ReactInstanceManager，简单说一下建造者模式(Builder模式)：
+>当一个类创建时，需要的参数很多，并且有些参数可以缺省。这时如果采用构造函数方式，那么就要写多个构造函数来适应不同的情况，很容易造成混乱。而Builder模式可以解决这个问题，因为它可以为缺省参数设置默认值。它主要解决构造参数过多的类实例的构建。
+
+我们看来设置的参数：
+  1. mApplication：代表application的Context用来创建ReactApplicationContext。
+  2. getJSMainModuleName()：代表js端启动文件的名字，默认"index.android"。
+  3. getUseDeveloperSupport()：代表是开发环境或者是正式环境。
+  4. getRedBoxHandler()：这个作用没有具体看。
+  5. getJavaScriptExecutorFactory():用来创建js的执行器的，主要在c++端用的。最终会在c++创建JSCExecutor.cpp这个js执行器。
+  6. getUIImplementationProvider():用来生成UIImplementation，这类很重要，主要是与UIManagerModule类交互，所有js端的view事件都是这两个类完成的，UIManagerModule负责接收事件，然后交个UIImplementation处理，这个会在ReactNative View渲染机制中详解。
+  7. setInitialLifecycleState()：代表现在所处的生命周期。有三个值BEFORE_CREATE：创建之前，BEFORE_RESUME：显示在界面之前，RESUMED：显示在界面上。它们是由Activity的生命周期事件来切换的。
+  8. addPackage(reactPackage):添加ReactPackage。ReactPackage提供NativeModule和ViewManager列表，其实ViewManager也是NativeModule子类，但是它们的行为是不一样的。所有的ViewManager都是由UIManagerModule管理的。但是UIManagerModule其实也是一个NativeModule。关系很绕，但是理清了也很简单。这个会在ReactNative View渲染机制中详解。
+  9. setJSBundleFile和setBundleAssetName：这两个方法都是用来创建JSBundleLoader，用它来加载js文件的。
+  10. builder.build()：会调用ReactInstanceManager构造方法，创建ReactInstanceManager实例。ReactInstanceManager的构造方法参数有点多，我就不一一分析的，主要将成员变量进行赋值。
+
+##ReactRootView
+```
+  public void startReactApplication(
+      ReactInstanceManager reactInstanceManager,
+      String moduleName,
+      @Nullable Bundle initialProperties) {
+    Systrace.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE, "startReactApplication");
+    try {
+      UiThreadUtil.assertOnUiThread();
+
+      Assertions.assertCondition(
+        mReactInstanceManager == null,
+        "This root view has already been attached to a catalyst instance manager");
+
+      mReactInstanceManager = reactInstanceManager;
+      mJSModuleName = moduleName;
+      mAppProperties = initialProperties;
+
+      if (!mReactInstanceManager.hasStartedCreatingInitialContext()) {
+        mReactInstanceManager.createReactContextInBackground();
+      }
+
+      attachToReactInstanceManager();
+
+    } finally {
+      Systrace.endSection(TRACE_TAG_REACT_JAVA_BRIDGE);
+    }
+  }
+```
+首先判断了一下是否在UI线程，然后判断mReactInstanceManager是不是已经被赋值了。接下来就是对成员变量的赋值。
+  1. mReactInstanceManager：用来创建ReactContext和CatalystInstanceImpl，处理ReactActivity的生命周期事件。
+  2. mJSModuleName和mAppProperties：初始化时，传递给js端的数据。它们是在runApplication()这个方法中，通过AppRegistry这个JavaScriptModule传递给js端。至于java端怎么调用js端，我会在ReactNative 通信机制这个章节中详细分析的。
+  3. 如果mReactInstanceManager还没有创建ReactContext，那么就调用createReactContextInBackground方法来创建。这个方法会创建ReactContext，CatalystInstanceImpl。下面会重点分析这个方法。
+  4. attachToReactInstanceManager()：将这个ReactRootView依附到mReactInstanceManager中。
+##ReactInstanceManager
+这个类很重要，由它来创建ReactApplicationContext和CatalystInstanceImpl，并且管理所有的ReactRootView实例。
+分析一下ReactInstanceManager创建ReactContext的过程。你会发现ReactInstanceManager中createReactContextXXX以及recreateReactContextXXX的方法，它们最终会调用到runCreateReactContextOnNewThread(final ReactContextInitParams initParams)方法。
+```
+@ThreadConfined(UI)
+  private void runCreateReactContextOnNewThread(
+          final ReactContextInitParams initParams){
+     ``````
+}
+```
+ReactContextInitParams：主要有两个参数JavaScriptExecutorFactory和JSBundleLoader，一个是提供js的执行器(主要对应c++的实例),JSBundleLoader用于加载js端文件的加载器。
+ 这个方法主要作用开启一个新线程，并在新线程中调用createReactContext方法。
+```
+private ReactApplicationContext createReactContext(
+      JavaScriptExecutor jsExecutor,
+      JSBundleLoader jsBundleLoader) {
+    Log.d(ReactConstants.TAG, "ReactInstanceManager.createReactContext()");
+    ReactMarker.logMarker(CREATE_REACT_CONTEXT_START);
+    final ReactApplicationContext reactContext =
+        new ReactApplicationContext(mApplicationContext);
+
+    if (mUseDeveloperSupport) {
+      reactContext.setNativeModuleCallExceptionHandler(mDevSupportManager);
+    }
+
+    NativeModuleRegistry nativeModuleRegistry =
+        processPackages(reactContext, mPackages, false);
+
+    NativeModuleCallExceptionHandler exceptionHandler =
+      mNativeModuleCallExceptionHandler != null
+      ? mNativeModuleCallExceptionHandler
+      : mDevSupportManager;
+    CatalystInstanceImpl.Builder catalystInstanceBuilder =
+       new CatalystInstanceImpl.Builder()
+      .setReactQueueConfigurationSpec(mUseSeparateUIBackgroundThread ?
+        ReactQueueConfigurationSpec.createWithSeparateUIBackgroundThread() :
+        ReactQueueConfigurationSpec.createDefault())
+      .setJSExecutor(jsExecutor)
+      .setRegistry(nativeModuleRegistry)
+      .setJSBundleLoader(jsBundleLoader)
+      .setNativeModuleCallExceptionHandler(exceptionHandler);
+
+    ReactMarker.logMarker(CREATE_CATALYST_INSTANCE_START);
+    // CREATE_CATALYST_INSTANCE_END is in JSCExecutor.cpp
+    Systrace.beginSection(TRACE_TAG_REACT_JAVA_BRIDGE, "createCatalystInstance");
+    final CatalystInstance catalystInstance;
+    try {
+      catalystInstance = catalystInstanceBuilder.build();
+    } finally {
+      Systrace.endSection(TRACE_TAG_REACT_JAVA_BRIDGE);
+      ReactMarker.logMarker(CREATE_CATALYST_INSTANCE_END);
+    }
+
+    if (mBridgeIdleDebugListener != null) {
+      catalystInstance.addBridgeIdleDebugListener(mBridgeIdleDebugListener);
+    }
+    if (Systrace.isTracing(TRACE_TAG_REACT_APPS | TRACE_TAG_REACT_JSC_CALLS)) {
+      catalystInstance.setGlobalVariable("__RCTProfileIsProfiling", "true");
+    }
+    ReactMarker.logMarker(ReactMarkerConstants.PRE_RUN_JS_BUNDLE_START);
+    catalystInstance.runJSBundle();
+    if (!mInitFunctions.isEmpty()) {
+      for (CatalystInstanceImpl.PendingJSCall function : mInitFunctions) {
+        ((CatalystInstanceImpl) catalystInstance).callFunction(function);
+      }
+    }
+    reactContext.initializeWithInstance(catalystInstance);
+
+    return reactContext;
+  }
+```
+1. 通过mApplicationContext来创建ReactApplicationContext(是ReactContext的子类)，
+2. 创建NativeModuleRegistry，它会将mPackages中每个ReactPackage返回的List<NativeModule>集合都注册到NativeModuleRegistry中(注意不包含List<ViewManager>集合)。
+3. 创建CatalystInstanceImpl，这个类是真正与c++进行交互，进而调用js端代码也是采用Builder模式创建。
+4. 最后调用catalystInstance.runJSBundle()方法加载js文件。
+##CatalystInstanceImpl
+ java端主动调用c++端方法，就是通过这个类。它还将java端所有的NativeModule传递给c++端(通过NativeModuleRegistry)，并且还拥有JavaScriptModuleRegistry实例(通过它调用js端JavaScriptModule对应的方法)
+```
+ private CatalystInstanceImpl(
+      final ReactQueueConfigurationSpec reactQueueConfigurationSpec,
+      final JavaScriptExecutor jsExecutor,
+      final NativeModuleRegistry nativeModuleRegistry,
+      final JSBundleLoader jsBundleLoader,
+      NativeModuleCallExceptionHandler nativeModuleCallExceptionHandler) {
+    Log.d(ReactConstants.TAG, "Initializing React Xplat Bridge.");
+    mHybridData = initHybrid();
+
+    mReactQueueConfiguration = ReactQueueConfigurationImpl.create(
+        reactQueueConfigurationSpec,
+        new NativeExceptionHandler());
+    mBridgeIdleListeners = new CopyOnWriteArrayList<>();
+    mNativeModuleRegistry = nativeModuleRegistry;
+    mJSModuleRegistry = new JavaScriptModuleRegistry();
+    mJSBundleLoader = jsBundleLoader;
+    mNativeModuleCallExceptionHandler = nativeModuleCallExceptionHandler;
+    mNativeModulesQueueThread =
+         mReactQueueConfiguration.getNativeModulesQueueThread();
+    mUIBackgroundQueueThread =
+         mReactQueueConfiguration.getUIBackgroundQueueThread();
+    mTraceListener = new JSProfilerTraceListener(this);
+
+    Log.d(ReactConstants.TAG,
+         "Initializing React Xplat Bridge before initializeBridge");
+    initializeBridge(
+      new BridgeCallback(this),
+      jsExecutor,
+      mReactQueueConfiguration.getJSQueueThread(),
+      mNativeModulesQueueThread,
+      mUIBackgroundQueueThread,
+      mNativeModuleRegistry.getJavaModules(this),
+      mNativeModuleRegistry.getCxxModules());
+    Log.d(ReactConstants.TAG,
+         "Initializing React Xplat Bridge after initializeBridge");
+
+    mJavaScriptContextHolder = new JavaScriptContextHolder(getJavaScriptContext());
+  }
+```
+1. 通过ReactQueueConfigurationImpl.create方法：用来生成mJSQueueThread，mNativeModulesQueueThread，mUIBackgroundQueueThread，给c++端在不同线程回调java代码。
+ 2. mNativeModuleRegistry：提供java端所有的NativeModule给c++端，最终会在js端的NativeModules.js文件中注册这些NativeModule，然后js端可以回调c++端代码，通过c++代码再回调java端NativeModule的方法。详细过程我会在ReactNative 通信机制 章节中介绍。
+ 3. mJSModuleRegistry：JavaScriptModule的注册器，通过它我们可以调用js端JavaScriptModule对应的方法。
+ 4. mNativeModuleCallExceptionHandler：处理NativeModule方法调用时产生的异常
+ 5. initializeBridge：搭建 java <----> c++ <-----> js 的通信桥。
+#总结
+####整个创建流程：
+   1. ReactActivity->onCreate()：调用代理类的方法。
+   2. ReactActivityDelegate->onCreate(): 可能有系统悬浮框权限的判断，最主要的还是调用loadApp的方法。
+   3. ReactActivityDelegate->loadApp():创建ReactRootView，然后调用startReactApplication，最后将ReactRootView设置成ContentView。过程中可能还通过ReactNativeHost创建ReactInstanceManager。
+   4. ReactRootView->startReactApplication():最主要的是通过ReactInstanceManager创建ReactContext。顺便将这个ReactRootView添加到mReactInstanceManager中。
+   5. ReactInstanceManager->createReactContextInBackground：通过一系列的调用，最终会调用createReactContext方法。
+   6. ReactInstanceManager->createReactContext:这个方法最主要的是创建CatalystInstanceImpl，这个与c++交互的类。
+  7. CatalystInstanceImpl->initializeBridge: 构建与c++端的通信桥
+
+###下节预览
+启动流程我们已经说清楚了。下一节我们将分析ReactNative的整个通信机制，java端怎么调用js端，js端又是怎么调用java端，数据又是怎么相互传输的。请看下一章ReactNative 通信机制。
+
